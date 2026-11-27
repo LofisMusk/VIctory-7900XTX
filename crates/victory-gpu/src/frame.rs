@@ -81,7 +81,12 @@ pub(crate) extern "system" fn set_interval(
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
-    let interval = asked().unwrap_or(asked_by_title);
+    // Once loading is over with the title at a loading rate of its own
+    // (`VICTORY_LOAD_FPS`), what it asks for may still be that rate's
+    // (run h26: 66.7 ms again right after, 15 frames a second): the
+    // playing interval stays.
+    let playing = load_interval().is_some() && victory_core::LOADING_OVER.load(Ordering::Relaxed);
+    let interval = asked().unwrap_or(if playing { Duration::from_micros(33_333) } else { asked_by_title });
     tracing::info!(?interval, title = ?asked_by_title, "frame interval");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
@@ -153,6 +158,93 @@ fn next_tick(kind: u32) -> (u64, Duration) {
     )
 }
 
+/// Milliseconds since our first look at the time ([`loading_gate`]).
+fn since_start_ms() -> u64 {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// When a draw of the title's decoration bake was last seen
+/// ([`since_start_ms`], plus one; 0: none yet).
+static LAST_BAKE: AtomicU64 = AtomicU64::new(0);
+
+/// A draw of the title's skin and decoration bake (`crate::draw`).
+pub(crate) fn bake_seen() {
+    LAST_BAKE.store(since_start_ms() + 1, Ordering::Relaxed);
+}
+
+/// `VICTORY_LOAD_INTERVAL_MS=<ms>[,<hold s>]`: while the title loads, a
+/// frame takes at least that long, until no bake was drawn for `hold`
+/// seconds (10 unset), or ten minutes in all; then the frame interval as
+/// before, for the rest of the run. Off unset or 0.
+///
+/// The title bakes its characters' skin into textures of its own a set
+/// number of frames after it asks for the textures the bake reads; at our
+/// 25 frames a second those had not landed yet, and every character's head
+/// skin was baked as nothing for the whole run (Linux, RX 7900 XTX; 20 runs
+/// of 20, eyes, teeth and hair only). Capped at 5 a second for the whole
+/// run (`VICTORY_FRAME_INTERVAL_MS=200`) the skin was there; fxceless's
+/// tree, at 3 to 7 a second, had it in some runs and not in others.
+///
+/// That cap of ours alone (the title kept at its 30) did not bring the
+/// skin back; the title's own rate at 5 while it loads does
+/// (`VICTORY_LOAD_FPS`, the loader's): the end of loading is found here for
+/// that switch too ([`victory_core::LOADING_OVER`]), with `ms` 0.
+fn load_interval() -> Option<(u64, u64)> {
+    static SPEC: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    *SPEC.get_or_init(|| {
+        let spec = std::env::var("VICTORY_LOAD_INTERVAL_MS").ok();
+        let load_fps = std::env::var_os("VICTORY_LOAD_FPS").is_some();
+        let mut parts = spec.as_deref().unwrap_or("0").split(',').map(|p| p.trim().parse::<u64>().ok());
+        let ms = parts.next().flatten().unwrap_or(0).min(1000);
+        let hold = parts.next().flatten().unwrap_or(10);
+        if ms == 0 && !load_fps {
+            return None;
+        }
+        tracing::info!(ms, hold, "frames take at least ms while the title loads, until no bake for hold seconds (VICTORY_LOAD_INTERVAL_MS, VICTORY_LOAD_FPS)");
+        Some((ms, hold * 1000))
+    })
+}
+
+/// [`load_interval`]'s wait, at the start of a frame wait for the origin.
+fn loading_gate(kind: u32) {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if kind != ORIGIN || DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some((ms, hold)) = load_interval() else {
+        DONE.store(true, Ordering::Relaxed);
+        return;
+    };
+    let now = since_start_ms();
+    let bake = LAST_BAKE.load(Ordering::Relaxed);
+    if (bake != 0 && now > bake - 1 + hold) || now > 600_000 {
+        DONE.store(true, Ordering::Relaxed);
+        // The title asked for its loading rate's interval and will not ask
+        // again: ours from now is the one asked for, or the title's 30.
+        let interval = asked().unwrap_or(Duration::from_micros(33_333));
+        let first = LAST.iter().map(|t| t.load(Ordering::Relaxed)).max().unwrap_or(0);
+        *clock() = Some(Clock {
+            start: Instant::now(),
+            interval,
+            first,
+        });
+        victory_core::LOADING_OVER.store(true, Ordering::Relaxed);
+        tracing::info!(at_ms = now, last_bake_ms = bake.saturating_sub(1), ?interval, "loading over: frames at the playing interval from now (VICTORY_LOAD_INTERVAL_MS, VICTORY_LOAD_FPS)");
+        return;
+    }
+    if ms == 0 {
+        return;
+    }
+    // When the last gated frame began (plus one; 0: none yet).
+    static PREV: AtomicU64 = AtomicU64::new(0);
+    let prev = PREV.load(Ordering::Relaxed);
+    if prev != 0 && now < prev - 1 + ms {
+        std::thread::sleep(Duration::from_millis(prev - 1 + ms - now));
+    }
+    PREV.store(since_start_ms() + 1, Ordering::Relaxed);
+}
+
 /// Device method: blocks until the next tick (or the time-out); an origin
 /// wait then hands out the new frame's token. Other events keep the token
 /// the title passes. Ticks are absolute (start plus whole intervals), so
@@ -166,6 +258,7 @@ pub(crate) extern "system" fn wait(
     token: *mut u64,
 ) -> HRESULT {
     let origin = kind == ORIGIN;
+    loading_gate(kind);
     let (mut tick, mut wait) = next_tick(kind);
     let limit = Duration::from_millis(u64::from(timeout_ms));
     // A blocking wait for an event that has happened since the last wait

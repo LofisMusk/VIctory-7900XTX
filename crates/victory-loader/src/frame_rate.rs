@@ -224,6 +224,78 @@ pub unsafe fn apply(base: usize, size: usize, rate: u32, sites: &[Site]) -> Vec<
         .collect()
 }
 
+/// The shortest step of the title's timers, `1 / rate` in seconds (an
+/// `f32`), which the title makes of +0x2241fd0's rate when it applies its
+/// settings (+0x22435de, +0x2241190).
+pub const MIN_STEP: usize = 0x6849844;
+
+/// The rate a frame rate stands for in the title's code (0: its "no
+/// limit", 1000).
+fn effective(rate: u32) -> u32 {
+    if rate == 0 || rate >= 1000 { 1000 } else { rate }
+}
+
+/// Gives the title `rate` in place of `from` while it runs
+/// (`VICTORY_LOAD_FPS`: `from` while it loads, its playing rate after):
+/// each site [`apply`] patched for `from` loads `rate`, and what the title
+/// made of `from` when it applied its settings is made again of `rate`, as
+/// it would have: the frame time ([`FRAME_US`]) and the timers' shortest
+/// step ([`MIN_STEP`], only if it holds `1 / from`). The interval it asked
+/// for is our clock's business (`victory-gpu`'s `frame`). Returns the sites
+/// changed.
+///
+/// # Safety
+/// The image at `base` is the title's, `size` bytes, mapped.
+#[cfg(windows)]
+pub unsafe fn change(base: usize, size: usize, from: u32, rate: u32, sites: &[Site]) -> usize {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut changed = 0;
+    for site in sites {
+        let (old, new) = (replacement(site.kind, from), replacement(site.kind, rate));
+        if site.at.checked_add(old.len()).is_none_or(|end| end > size) {
+            continue;
+        }
+        let at = base + site.at;
+        // SAFETY: inside the mapped image (checked above).
+        if unsafe { std::slice::from_raw_parts(at as *const u8, old.len()) } != old.as_slice() {
+            continue;
+        }
+        let mut was = 0;
+        // SAFETY: the bytes `apply` wrote, made writable for this and put
+        // back. (Only the immediate changes; the title runs these when it
+        // applies its settings.)
+        unsafe {
+            if VirtualProtect(at as *const _, new.len(), PAGE_EXECUTE_READWRITE, &mut was) == 0 {
+                continue;
+            }
+            std::ptr::copy_nonoverlapping(new.as_ptr(), at as *mut u8, new.len());
+            VirtualProtect(at as *const _, new.len(), was, &mut was);
+            FlushInstructionCache(GetCurrentProcess(), at as *const _, new.len());
+        }
+        changed += 1;
+    }
+    if FRAME_US + 4 <= size {
+        // SAFETY: title data inside the image, a u32 the title writes.
+        unsafe { ((base + FRAME_US) as *mut u32).write_volatile(title_frame_us(rate)) };
+    }
+    if MIN_STEP + 4 <= size {
+        let at = (base + MIN_STEP) as *mut f32;
+        // SAFETY: as above, an f32.
+        let step = unsafe { at.read_volatile() };
+        let expected = 1.0 / effective(from) as f32;
+        if (step - expected).abs() < 1e-5 {
+            // SAFETY: as above.
+            unsafe { at.write_volatile(1.0 / effective(rate) as f32) };
+            tracing::info!(from, rate, "frame rate: the title's rate changed while it runs (sites, frame time, timers' shortest step)");
+        } else {
+            tracing::warn!(from, rate, step, expected, "frame rate: the timers' shortest step is not 1 / the loading rate: left as it is");
+        }
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

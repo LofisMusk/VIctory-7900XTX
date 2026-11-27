@@ -197,8 +197,37 @@ pub fn run(
     // clock ticks at that interval (victory-gpu), and the title is given
     // the matching rate in place of its setting's 30 (VICTORY_TITLE_FPS
     // overrides it; `off` leaves the title alone).
+    // VICTORY_LOAD_FPS=<rate>: the title runs at that rate while it loads
+    // and at its playing rate after (the one above, or its 30): at 25 or
+    // more frames a second it baked its characters' skin before the
+    // textures were there, and every head was without it for the run
+    // (Linux, RX 7900 XTX); at 5 they were there. The end of loading is
+    // victory-gpu's (no bake for ten seconds).
     #[cfg(windows)]
-    if execute && let Some(ms) = victory_loader::frame_rate::asked_interval_ms() {
+    if execute
+        && let Some(load) = std::env::var("VICTORY_LOAD_FPS").ok().and_then(|v| v.trim().parse::<u32>().ok()).filter(|r| (1..1000).contains(r))
+    {
+        use victory_loader::frame_rate::{Patched, SITES, apply, change, title_rate};
+        let play = victory_loader::frame_rate::asked_interval_ms()
+            .and_then(|ms| title_rate(ms, std::env::var("VICTORY_TITLE_FPS").ok().as_deref()))
+            .unwrap_or(30);
+        let size = image.info().size_of_image as usize;
+        let base = image.base();
+        // SAFETY: the image stays mapped and nothing of it has run yet.
+        let done = unsafe { apply(base, size, load, &SITES) };
+        let patched = done.iter().filter(|d| **d == Patched::Done).count();
+        println!("frame rate: the title's rate {load} while it loads, {play} after ({patched} of {} reads of its setting patched)", SITES.len());
+        if patched > 0 {
+            std::thread::spawn(move || {
+                while !victory_core::LOADING_OVER.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                // SAFETY: the title's image, mapped for the run.
+                let changed = unsafe { change(base, size, load, play, &SITES) };
+                println!("frame rate: loading over, the title's rate {play} from now ({changed} sites)");
+            });
+        }
+    } else if execute && let Some(ms) = victory_loader::frame_rate::asked_interval_ms() {
         use victory_loader::frame_rate::{Patched, SITES, apply, title_interval_us, title_rate};
         let asked = std::env::var("VICTORY_TITLE_FPS").ok();
         match title_rate(ms, asked.as_deref()) {
