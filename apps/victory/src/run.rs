@@ -204,9 +204,7 @@ pub fn run(
     // (Linux, RX 7900 XTX); at 5 they were there. The end of loading is
     // victory-gpu's (no bake for ten seconds).
     #[cfg(windows)]
-    if execute
-        && let Some(load) = std::env::var("VICTORY_LOAD_FPS").ok().and_then(|v| v.trim().parse::<u32>().ok()).filter(|r| (1..1000).contains(r))
-    {
+    if execute && let Some(load) = victory_core::loading_frame_rate() {
         use victory_loader::frame_rate::{Patched, SITES, apply, change, title_rate};
         let play = victory_loader::frame_rate::asked_interval_ms()
             .and_then(|ms| title_rate(ms, std::env::var("VICTORY_TITLE_FPS").ok().as_deref()))
