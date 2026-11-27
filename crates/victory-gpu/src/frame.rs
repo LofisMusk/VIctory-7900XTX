@@ -194,7 +194,7 @@ fn load_interval() -> Option<(u64, u64)> {
     static SPEC: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
     *SPEC.get_or_init(|| {
         let spec = std::env::var("VICTORY_LOAD_INTERVAL_MS").ok();
-        let load_fps = std::env::var_os("VICTORY_LOAD_FPS").is_some();
+        let load_fps = victory_core::loading_frame_rate().is_some();
         let mut parts = spec.as_deref().unwrap_or("0").split(',').map(|p| p.trim().parse::<u64>().ok());
         let ms = parts.next().flatten().unwrap_or(0).min(1000);
         let hold = parts.next().flatten().unwrap_or(10);
